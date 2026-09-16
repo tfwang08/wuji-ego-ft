@@ -10,7 +10,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from core.registry import DATASETS
 from data.lingbotmap.lerobot_v3 import LeRobotV3Dataset
-from data.my_data.dataset import MyDataDataset
+from data.x2robot.mint_dataset import MyDataDataset
 from data.sampling import (
     dataset_sample_seed,
     deterministic_subset_indices,
@@ -51,12 +51,6 @@ def _build_child_dataset(child_cfg: dict):
 
 
 def build_dataset(cfg: dict):
-
-
-
-
-
-
     root = cfg["root"]
     if isinstance(root, list):
         children = []
