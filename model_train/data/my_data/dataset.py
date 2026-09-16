@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""X2Robot MINT fine-tuning dataset backed by manifest + virtual MP4 + NPZ labels.
+"""Generic calibrated MINT fine-tuning dataset.
 
-The normalized dataset is expected to follow ``x2robot_mint_finetune_v1``:
+Expected layout::
 
     <root>/splits/train.jsonl
     <root>/episodes/.../video_<view>_virtual.mp4
     <root>/episodes/.../labels_<view>.npz
 
-Each manifest row describes one fixed-length, single-view, single-hand window. This
-loader keeps the batch keys used by the upstream MINT training code while also
-exposing calibrated 2D/QC fields for validation and future losses.
+Each manifest row describes one fixed-length, single-view, single-hand window.
+The loader preserves the upstream MINT batch keys and also returns calibrated
+2D/QC fields for validation and later 2D losses.
 """
 
 from collections import OrderedDict
@@ -36,6 +36,7 @@ _REQUIRED_META = {
     "label_path",
     "label_row_start",
 }
+
 _REQUIRED_LABELS = {
     "frame_index",
     "timestamp",
@@ -71,9 +72,9 @@ def _finite_or_zero(array: np.ndarray) -> np.ndarray:
     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-@DATASETS.register("x2robot_mint")
-class X2RobotMintDataset(BaseClipDataset):
-    """Read calibrated X2Robot clips in the normalized MINT fine-tuning format."""
+@DATASETS.register("my_data")
+class MyDataDataset(BaseClipDataset):
+    """Read normalized virtual-camera clips for MINT hand fine-tuning."""
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
@@ -108,7 +109,8 @@ class X2RobotMintDataset(BaseClipDataset):
         else:
             split_path = os.path.join(self.root, "splits", f"{self.split}.jsonl")
             self.manifest_path = (
-                split_path if os.path.isfile(split_path)
+                split_path
+                if os.path.isfile(split_path)
                 else os.path.join(self.root, "manifest.jsonl")
             )
         if not os.path.isfile(self.manifest_path):
@@ -122,10 +124,11 @@ class X2RobotMintDataset(BaseClipDataset):
                     continue
             self._validate_manifest_item(item)
             self.samples.append(item)
+
         if not self.samples:
+            tiers = sorted(self.quality_tiers) if self.quality_tiers else None
             raise RuntimeError(
-                f"no usable samples in {self.manifest_path}; "
-                f"quality_tiers={sorted(self.quality_tiers) if self.quality_tiers else None}"
+                f"no usable samples in {self.manifest_path}; quality_tiers={tiers}"
             )
 
     def _resolve_path(self, path: str) -> str:
@@ -186,6 +189,7 @@ class X2RobotMintDataset(BaseClipDataset):
         if cached is not None:
             self._video_cache[path] = cached
             return cached
+
         if not os.path.isfile(path):
             raise FileNotFoundError(f"video file does not exist: {path}")
         from decord import VideoReader
@@ -249,9 +253,10 @@ class X2RobotMintDataset(BaseClipDataset):
 
         vertical_fov = 2.0 * math.atan(height / (2.0 * fy))
         horizontal_fov = 2.0 * math.atan(width / (2.0 * fx))
-        cam_fov = torch.tensor(
-            [vertical_fov, horizontal_fov], dtype=torch.float32
-        )
+        cam_fov = torch.tensor([vertical_fov, horizontal_fov], dtype=torch.float32)
+
+        # Compatibility field for upstream losses/tools. Camera trajectory itself
+        # is not supervised by this dataset; only calibrated FoV is meaningful.
         gt_pose_enc = torch.zeros(self.clip_len, 9, dtype=torch.float32)
         gt_pose_enc[:, 6] = 1.0  # identity quaternion in xyzw convention
         gt_pose_enc[:, 7:9] = cam_fov
@@ -315,7 +320,7 @@ class X2RobotMintDataset(BaseClipDataset):
             "kpt21_2d": (self.clip_len, 2, 21, 2),
             "kpt21_2d_valid": (self.clip_len, 2, 21),
         }
-        actual = {
+        actual_shapes = {
             "hand_gt": hand_gt.shape,
             "hand_kept": hand_kept_raw.shape,
             "quality_mask": quality_mask.shape,
@@ -326,9 +331,9 @@ class X2RobotMintDataset(BaseClipDataset):
             "kpt21_2d_valid": kpt21_2d_valid.shape,
         }
         bad = {
-            key: (actual[key], shape)
-            for key, shape in expected_shapes.items()
-            if actual[key] != shape
+            name: (actual_shapes[name], shape)
+            for name, shape in expected_shapes.items()
+            if actual_shapes[name] != shape
         }
         if bad:
             raise RuntimeError(f"sample {sample_id}: invalid label shapes: {bad}")
@@ -344,8 +349,8 @@ class X2RobotMintDataset(BaseClipDataset):
             )
 
         hand_gt_view = hand_gt.reshape(self.clip_len, 2, 109)
-        valid_hand_values = np.isfinite(hand_gt_view).all(axis=-1)
-        if np.any(hand_kept & ~valid_hand_values):
+        finite_hand = np.isfinite(hand_gt_view).all(axis=-1)
+        if np.any(hand_kept & ~finite_hand):
             raise RuntimeError(
                 f"sample {sample_id}: supervised hand_gt contains non-finite values"
             )
@@ -378,10 +383,10 @@ class X2RobotMintDataset(BaseClipDataset):
 
         K_virtual, cam_fov, gt_pose_enc = self._camera_fields(labels, sample_id)
 
-        supervised_joint_mask = kpt21_3d_valid & hand_kept[..., None]
         required_joint_mask = np.broadcast_to(
             hand_kept[..., None], kpt21_3d_valid.shape
         )
+        supervised_joint_mask = kpt21_3d_valid & required_joint_mask
         kpt21_gt_valid = bool(
             not required_joint_mask.any()
             or supervised_joint_mask[required_joint_mask].all()
@@ -404,7 +409,7 @@ class X2RobotMintDataset(BaseClipDataset):
             "kpt21_gt": torch.from_numpy(kpt21_3d),
             "kpt21_gt_valid": torch.tensor(kpt21_gt_valid, dtype=torch.bool),
 
-            # Calibrated X2Robot/QC fields retained for exact 2D validation/losses.
+            # Calibrated fields retained for exact 2D validation/losses.
             "K_virtual": K_virtual,
             "cam_fov": cam_fov,
             "hand_kept_raw": torch.from_numpy(hand_kept_raw.copy()),
