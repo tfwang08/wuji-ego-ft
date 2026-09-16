@@ -38,6 +38,7 @@ _REQUIRED_META = {
 }
 _REQUIRED_LABELS = {
     "frame_index",
+    "timestamp",
     "hand_kept",
     "hand_gt",
     "kpt21_3d",
@@ -86,8 +87,11 @@ class X2RobotMintDataset(BaseClipDataset):
         self.principal_point_tolerance_px = float(
             cfg.get("principal_point_tolerance_px", 0.5)
         )
+        self.intrinsics_tolerance = float(cfg.get("intrinsics_tolerance", 1.0e-6))
         if self.principal_point_tolerance_px < 0:
             raise ValueError("principal_point_tolerance_px must be non-negative")
+        if self.intrinsics_tolerance < 0:
+            raise ValueError("intrinsics_tolerance must be non-negative")
 
         quality_tiers = cfg.get("quality_tiers", ["gold"])
         self.quality_tiers = None if quality_tiers is None else {
@@ -150,6 +154,12 @@ class X2RobotMintDataset(BaseClipDataset):
             )
         if int(item["frame_start"]) < 0 or int(item["label_row_start"]) < 0:
             raise RuntimeError(f"sample {item['sample_id']} has negative frame/label start")
+        image_hw = item.get("image_hw")
+        if image_hw is not None and tuple(int(v) for v in image_hw) != self.size_hw:
+            raise RuntimeError(
+                f"sample {item['sample_id']} image_hw={image_hw} does not match "
+                f"data.size_hw={self.size_hw}"
+            )
 
     def _load_labels(self, path: str) -> Dict[str, np.ndarray]:
         cached = self._label_cache.pop(path, None)
@@ -216,6 +226,18 @@ class X2RobotMintDataset(BaseClipDataset):
             raise RuntimeError(f"sample {sample_id}: K_virtual has non-positive focal length")
 
         if self.author_projector_compatible:
+            matrix_tol = self.intrinsics_tolerance
+            if (
+                abs(float(K[0, 1])) > matrix_tol
+                or abs(float(K[1, 0])) > matrix_tol
+                or abs(float(K[2, 0])) > matrix_tol
+                or abs(float(K[2, 1])) > matrix_tol
+                or abs(float(K[2, 2]) - 1.0) > matrix_tol
+            ):
+                raise RuntimeError(
+                    f"sample {sample_id}: K_virtual contains skew/non-canonical "
+                    "homogeneous terms that upstream MINT FoV projection cannot represent"
+                )
             expected_cx, expected_cy = width / 2.0, height / 2.0
             tol = self.principal_point_tolerance_px
             if abs(cx - expected_cx) > tol or abs(cy - expected_cy) > tol:
@@ -264,6 +286,15 @@ class X2RobotMintDataset(BaseClipDataset):
                 f"labels={frame_index[[0, -1]].tolist()} expected="
                 f"{expected_frames[[0, -1]].tolist()}"
             )
+
+        timestamp = np.asarray(labels["timestamp"][rows], dtype=np.float64)
+        if timestamp.shape != (self.clip_len,):
+            raise RuntimeError(
+                f"sample {sample_id}: timestamp must have shape [{self.clip_len}], "
+                f"got {timestamp.shape}"
+            )
+        if not np.isfinite(timestamp).all() or np.any(np.diff(timestamp) <= 0.0):
+            raise RuntimeError(f"sample {sample_id}: timestamp must be finite and increasing")
 
         hand_gt = np.asarray(labels["hand_gt"][rows], dtype=np.float32)
         hand_kept_raw = np.asarray(labels["hand_kept"][rows], dtype=bool)
@@ -383,6 +414,7 @@ class X2RobotMintDataset(BaseClipDataset):
             "kpt21_2d": torch.from_numpy(kpt21_2d),
             "kpt21_2d_valid": torch.from_numpy(kpt21_2d_valid.copy()),
             "frame_index": torch.from_numpy(frame_index.copy()),
+            "timestamp": torch.from_numpy(timestamp.copy()),
             "fps": torch.tensor(fps, dtype=torch.float32),
             "sample_id": sample_id,
             "view": str(meta["view"]),
