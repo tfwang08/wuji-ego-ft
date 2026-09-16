@@ -7,16 +7,18 @@ Expected layout::
     <root>/splits/train.jsonl
     <root>/episodes/.../video_<view>_virtual.mp4
     <root>/episodes/.../labels_<view>.npz
+    <root>/episodes/.../episode_camera_pose.npz
 
 Each manifest row describes one fixed-length, single-view, single-hand window.
-The loader preserves the upstream MINT batch keys and also returns calibrated
-2D/QC fields for validation and later 2D losses.
+The loader preserves the upstream MINT batch keys while adapting canonical
+SLAM/VIO C2W poses into the current virtual-camera pose expected by MINT.
 """
 
 from collections import OrderedDict
 import json
 import math
 import os
+import sys
 from typing import Dict, Iterable, List
 
 import numpy as np
@@ -24,6 +26,14 @@ import torch
 
 from core.registry import DATASETS
 from data.base_dataset import BaseClipDataset
+
+
+_MODEL_TRAIN = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_VENDOR = os.path.join(_MODEL_TRAIN, "_vendor")
+if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
+
+from lingbot_map.utils.rotation import mat_to_quat, quat_to_mat  # noqa: E402
 
 
 _REQUIRED_META = {
@@ -35,6 +45,7 @@ _REQUIRED_META = {
     "video_path",
     "label_path",
     "label_row_start",
+    "slam_pose_path",
 }
 
 _REQUIRED_LABELS = {
@@ -50,6 +61,16 @@ _REQUIRED_LABELS = {
     "quality_score",
     "K_virtual",
     "image_size_wh",
+    "rectify_R",
+}
+
+_REQUIRED_POSE = {
+    "T_world_wnl",
+    "valid",
+    "frame_ids",
+    "frame_ts_ns",
+    "query_ts_ns",
+    "source",
 }
 
 
@@ -72,9 +93,38 @@ def _finite_or_zero(array: np.ndarray) -> np.ndarray:
     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _scalar_text(value) -> str:
+    array = np.asarray(value)
+    if array.shape not in [(), (1,)]:
+        raise RuntimeError(f"expected scalar string, got shape {array.shape}")
+    item = array.reshape(-1)[0] if array.shape else array.item()
+    if isinstance(item, bytes):
+        item = item.decode("utf-8")
+    return str(item)
+
+
+def _check_rigid_transforms(transforms: np.ndarray, *, name: str, atol: float) -> None:
+    transforms = np.asarray(transforms, dtype=np.float64)
+    if transforms.ndim != 3 or transforms.shape[-2:] != (4, 4):
+        raise RuntimeError(f"{name} must have shape [F,4,4], got {transforms.shape}")
+    if not np.isfinite(transforms).all():
+        raise RuntimeError(f"{name} contains non-finite values")
+    expected_bottom = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    if not np.allclose(transforms[:, 3, :], expected_bottom, atol=atol, rtol=0.0):
+        raise RuntimeError(f"{name} has non-canonical homogeneous rows")
+    rotation = transforms[:, :3, :3]
+    identity = np.eye(3, dtype=np.float64)
+    ortho = np.swapaxes(rotation, -1, -2) @ rotation
+    if not np.allclose(ortho, identity, atol=atol, rtol=0.0):
+        raise RuntimeError(f"{name} contains non-orthogonal rotations")
+    determinant = np.linalg.det(rotation)
+    if not np.allclose(determinant, 1.0, atol=atol, rtol=0.0):
+        raise RuntimeError(f"{name} contains rotations with determinant != +1")
+
+
 @DATASETS.register("my_data")
 class MyDataDataset(BaseClipDataset):
-    """Read normalized virtual-camera clips for MINT hand fine-tuning."""
+    """Read normalized virtual-camera clips for MINT fine-tuning."""
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
@@ -89,10 +139,18 @@ class MyDataDataset(BaseClipDataset):
             cfg.get("principal_point_tolerance_px", 0.5)
         )
         self.intrinsics_tolerance = float(cfg.get("intrinsics_tolerance", 1.0e-6))
+        self.pose_rigid_tolerance = float(cfg.get("pose_rigid_tolerance", 1.0e-5))
+        self.pose_roundtrip_tolerance = float(
+            cfg.get("pose_roundtrip_tolerance", 1.0e-5)
+        )
         if self.principal_point_tolerance_px < 0:
             raise ValueError("principal_point_tolerance_px must be non-negative")
         if self.intrinsics_tolerance < 0:
             raise ValueError("intrinsics_tolerance must be non-negative")
+        if self.pose_rigid_tolerance <= 0:
+            raise ValueError("pose_rigid_tolerance must be positive")
+        if self.pose_roundtrip_tolerance <= 0:
+            raise ValueError("pose_roundtrip_tolerance must be positive")
 
         quality_tiers = cfg.get("quality_tiers", ["gold"])
         self.quality_tiers = None if quality_tiers is None else {
@@ -100,8 +158,10 @@ class MyDataDataset(BaseClipDataset):
         }
         self.label_cache_size = max(0, int(cfg.get("label_cache_size", 2)))
         self.video_cache_size = max(0, int(cfg.get("video_cache_size", 2)))
+        self.pose_cache_size = max(0, int(cfg.get("pose_cache_size", 2)))
         self._label_cache = OrderedDict()
         self._video_cache = OrderedDict()
+        self._pose_cache = OrderedDict()
 
         manifest_cfg = cfg.get("manifest")
         if manifest_cfg:
@@ -161,26 +221,56 @@ class MyDataDataset(BaseClipDataset):
                 f"sample {item['sample_id']} image_hw={image_hw} does not match "
                 f"data.size_hw={self.size_hw}"
             )
+        pose_scale = float(item.get("pose_translation_scale_to_m", 1.0))
+        if not math.isfinite(pose_scale) or pose_scale <= 0.0:
+            raise RuntimeError(
+                f"sample {item['sample_id']} has invalid pose_translation_scale_to_m="
+                f"{pose_scale}"
+            )
+
+    def _load_npz_cached(
+        self,
+        path: str,
+        *,
+        cache: OrderedDict,
+        cache_size: int,
+        required: set,
+        kind: str,
+    ) -> Dict[str, np.ndarray]:
+        cached = cache.pop(path, None)
+        if cached is not None:
+            cache[path] = cached
+            return cached
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{kind} file does not exist: {path}")
+        with np.load(path, allow_pickle=False) as archive:
+            missing = sorted(required - set(archive.files))
+            if missing:
+                raise RuntimeError(f"{kind} file {path} missing fields: {missing}")
+            result = {name: archive[name] for name in archive.files}
+        if cache_size > 0:
+            cache[path] = result
+            while len(cache) > cache_size:
+                cache.popitem(last=False)
+        return result
 
     def _load_labels(self, path: str) -> Dict[str, np.ndarray]:
-        cached = self._label_cache.pop(path, None)
-        if cached is not None:
-            self._label_cache[path] = cached
-            return cached
+        return self._load_npz_cached(
+            path,
+            cache=self._label_cache,
+            cache_size=self.label_cache_size,
+            required=_REQUIRED_LABELS,
+            kind="label",
+        )
 
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"label file does not exist: {path}")
-        with np.load(path, allow_pickle=False) as archive:
-            missing = sorted(_REQUIRED_LABELS - set(archive.files))
-            if missing:
-                raise RuntimeError(f"label file {path} missing fields: {missing}")
-            labels = {name: archive[name] for name in archive.files}
-
-        if self.label_cache_size > 0:
-            self._label_cache[path] = labels
-            while len(self._label_cache) > self.label_cache_size:
-                self._label_cache.popitem(last=False)
-        return labels
+    def _load_pose(self, path: str) -> Dict[str, np.ndarray]:
+        return self._load_npz_cached(
+            path,
+            cache=self._pose_cache,
+            cache_size=self.pose_cache_size,
+            required=_REQUIRED_POSE,
+            kind="camera pose",
+        )
 
     def _video_reader(self, path: str):
         cached = self._video_cache.pop(path, None)
@@ -253,10 +343,227 @@ class MyDataDataset(BaseClipDataset):
         cam_fov = torch.tensor(
             [vertical_fov, horizontal_fov], dtype=torch.float32
         )
-        gt_pose_enc = torch.zeros(self.clip_len, 9, dtype=torch.float32)
-        gt_pose_enc[:, 6] = 1.0
-        gt_pose_enc[:, 7:9] = cam_fov
-        return torch.from_numpy(K.astype(np.float32)), cam_fov, gt_pose_enc
+        return torch.from_numpy(K.astype(np.float32)), cam_fov
+
+    def _pose_window(
+        self,
+        meta: dict,
+        labels: Dict[str, np.ndarray],
+        frame_start: int,
+        sample_id: str,
+    ):
+        pose_path = self._resolve_path(str(meta["slam_pose_path"]))
+        pose = self._load_pose(pose_path)
+        pose_stop = frame_start + self.clip_len
+
+        frame_ids_all = np.asarray(pose["frame_ids"], dtype=np.int64)
+        if pose_stop > len(frame_ids_all):
+            raise RuntimeError(
+                f"sample {sample_id}: pose rows [{frame_start},{pose_stop}) exceed "
+                f"{len(frame_ids_all)} rows"
+            )
+        rows = slice(frame_start, pose_stop)
+        expected_frames = np.arange(frame_start, pose_stop, dtype=np.int64)
+        frame_ids = frame_ids_all[rows]
+        if not np.array_equal(frame_ids, expected_frames):
+            raise RuntimeError(
+                f"sample {sample_id}: pose frame_ids do not match video frame range"
+            )
+
+        T_world_wnl = np.asarray(pose["T_world_wnl"][rows], dtype=np.float64).copy()
+        slam_valid = np.asarray(pose["valid"][rows], dtype=bool)
+        frame_ts_ns = np.asarray(pose["frame_ts_ns"][rows], dtype=np.int64)
+        query_ts_ns = np.asarray(pose["query_ts_ns"][rows], dtype=np.int64)
+        source = _scalar_text(pose["source"])
+
+        if T_world_wnl.shape != (self.clip_len, 4, 4):
+            raise RuntimeError(
+                f"sample {sample_id}: T_world_wnl must be "
+                f"[{self.clip_len},4,4], got {T_world_wnl.shape}"
+            )
+        if slam_valid.shape != (self.clip_len,):
+            raise RuntimeError(
+                f"sample {sample_id}: slam valid must be [{self.clip_len}], "
+                f"got {slam_valid.shape}"
+            )
+        if frame_ts_ns.shape != (self.clip_len,) or query_ts_ns.shape != (self.clip_len,):
+            raise RuntimeError(
+                f"sample {sample_id}: SLAM timestamps must be [{self.clip_len}]"
+            )
+        if np.any(np.diff(frame_ts_ns) <= 0):
+            raise RuntimeError(f"sample {sample_id}: frame_ts_ns must be strictly increasing")
+
+        pose_offset_ns = int(meta.get("pose_offset_ns", 0))
+        if not np.array_equal(query_ts_ns, frame_ts_ns + pose_offset_ns):
+            raise RuntimeError(
+                f"sample {sample_id}: query_ts_ns != frame_ts_ns + pose_offset_ns"
+            )
+
+        scale_to_m = float(meta.get("pose_translation_scale_to_m", 1.0))
+        T_world_wnl[:, :3, 3] *= scale_to_m
+        _check_rigid_transforms(
+            T_world_wnl,
+            name=f"sample {sample_id}: T_world_wnl",
+            atol=self.pose_rigid_tolerance,
+        )
+
+        if source == "fixed_camera":
+            identity = np.eye(4, dtype=np.float64)
+            if not np.all(slam_valid):
+                raise RuntimeError(
+                    f"sample {sample_id}: fixed_camera pose contains invalid frames"
+                )
+            if not np.allclose(
+                T_world_wnl, identity, atol=self.pose_rigid_tolerance, rtol=0.0
+            ):
+                raise RuntimeError(
+                    f"sample {sample_id}: fixed_camera pose is not identity"
+                )
+
+        if not np.all(slam_valid):
+            bad = np.flatnonzero(~slam_valid).tolist()
+            raise RuntimeError(
+                f"sample {sample_id}: SLAM invalid inside training window at offsets {bad}; "
+                "the upstream camera loss has no per-frame mask, so invalid-pose windows "
+                "must be excluded by the manifest"
+            )
+
+        right_offset_ns = int(meta.get("right_offset_ns", 0))
+        precomputed = labels.get("T_world_view_virtual")
+        if precomputed is not None:
+            label_start = int(meta["label_row_start"])
+            label_stop = label_start + self.clip_len
+            T_world_view_virtual_saved = np.asarray(
+                precomputed[label_start:label_stop], dtype=np.float64
+            )
+            _check_rigid_transforms(
+                T_world_view_virtual_saved,
+                name=f"sample {sample_id}: stored T_world_view_virtual",
+                atol=self.pose_rigid_tolerance,
+            )
+        else:
+            T_world_view_virtual_saved = None
+
+        view = str(meta["view"])
+        rectify_R = np.asarray(labels["rectify_R"], dtype=np.float64)
+        if rectify_R.shape != (3, 3) or not np.isfinite(rectify_R).all():
+            raise RuntimeError(
+                f"sample {sample_id}: rectify_R must be finite [3,3], got "
+                f"{rectify_R.shape}"
+            )
+        if not np.allclose(
+            rectify_R.T @ rectify_R,
+            np.eye(3),
+            atol=self.pose_rigid_tolerance,
+            rtol=0.0,
+        ) or not math.isclose(
+            float(np.linalg.det(rectify_R)),
+            1.0,
+            abs_tol=self.pose_rigid_tolerance,
+        ):
+            raise RuntimeError(f"sample {sample_id}: rectify_R is not a proper rotation")
+
+        A_virtual = np.eye(4, dtype=np.float64)
+        A_virtual[:3, :3] = rectify_R.T
+
+        if view == "left":
+            view_raw_from_left = np.eye(4, dtype=np.float64)
+        else:
+            if right_offset_ns != 0 and T_world_view_virtual_saved is None:
+                raise RuntimeError(
+                    f"sample {sample_id}: right_offset_ns={right_offset_ns} requires "
+                    "precomputed T_world_view_virtual; the DataLoader will not guess "
+                    "right-eye pose timing"
+                )
+            if "T_right_from_left" not in labels:
+                raise RuntimeError(
+                    f"sample {sample_id}: right-view labels require T_right_from_left"
+                )
+            T_right_from_left = np.asarray(
+                labels["T_right_from_left"], dtype=np.float64
+            )
+            if T_right_from_left.shape != (4, 4):
+                raise RuntimeError(
+                    f"sample {sample_id}: T_right_from_left must be [4,4]"
+                )
+            _check_rigid_transforms(
+                T_right_from_left[None],
+                name=f"sample {sample_id}: T_right_from_left",
+                atol=self.pose_rigid_tolerance,
+            )
+            view_raw_from_left = np.linalg.inv(T_right_from_left)
+
+        T_world_view_virtual_computed = (
+            T_world_wnl @ view_raw_from_left[None] @ A_virtual[None]
+        )
+        _check_rigid_transforms(
+            T_world_view_virtual_computed,
+            name=f"sample {sample_id}: computed T_world_view_virtual",
+            atol=self.pose_rigid_tolerance,
+        )
+
+        if T_world_view_virtual_saved is not None:
+            if right_offset_ns == 0 and not np.allclose(
+                T_world_view_virtual_saved,
+                T_world_view_virtual_computed,
+                atol=5.0 * self.pose_rigid_tolerance,
+                rtol=0.0,
+            ):
+                raise RuntimeError(
+                    f"sample {sample_id}: stored T_world_view_virtual disagrees with "
+                    "SLAM + rig extrinsics + rectify_R"
+                )
+            T_world_view_virtual = T_world_view_virtual_saved
+        else:
+            T_world_view_virtual = T_world_view_virtual_computed
+
+        return {
+            "T_world_wnl": T_world_wnl,
+            "T_world_view_virtual": T_world_view_virtual,
+            "slam_valid": slam_valid,
+            "frame_ts_ns": frame_ts_ns,
+            "query_ts_ns": query_ts_ns,
+            "source": source,
+            "view_raw_from_left": view_raw_from_left,
+        }
+
+    def _encode_pose(
+        self,
+        T_world_view_virtual: np.ndarray,
+        cam_fov: torch.Tensor,
+        sample_id: str,
+    ) -> torch.Tensor:
+        T0_inv = np.linalg.inv(T_world_view_virtual[0])
+        T_rel = T0_inv[None] @ T_world_view_virtual
+        _check_rigid_transforms(
+            T_rel,
+            name=f"sample {sample_id}: rebased T_rel",
+            atol=self.pose_rigid_tolerance,
+        )
+
+        rotation = torch.from_numpy(T_rel[:, :3, :3].astype(np.float32))
+        with torch.no_grad():
+            quaternion = mat_to_quat(rotation)
+            decoded_rotation = quat_to_mat(quaternion)
+        if not torch.allclose(
+            decoded_rotation,
+            rotation,
+            atol=self.pose_roundtrip_tolerance,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                f"sample {sample_id}: pose quaternion round-trip failed"
+            )
+
+        translation = torch.from_numpy(T_rel[:, :3, 3].astype(np.float32))
+        fov = cam_fov.reshape(1, 2).expand(self.clip_len, 2)
+        gt_pose_enc = torch.cat((translation, quaternion.float(), fov), dim=-1)
+        if gt_pose_enc.shape != (self.clip_len, 9):
+            raise RuntimeError(
+                f"sample {sample_id}: gt_pose_enc has invalid shape "
+                f"{tuple(gt_pose_enc.shape)}"
+            )
+        return gt_pose_enc.contiguous()
 
     def __getitem__(self, idx):
         meta = self.samples[idx]
@@ -377,7 +684,11 @@ class MyDataDataset(BaseClipDataset):
         images = torch.from_numpy(frames).permute(0, 3, 1, 2).float().div_(255.0)
         images = images.contiguous()
 
-        K_virtual, cam_fov, gt_pose_enc = self._camera_fields(labels, sample_id)
+        K_virtual, cam_fov = self._camera_fields(labels, sample_id)
+        pose_window = self._pose_window(meta, labels, frame_start, sample_id)
+        gt_pose_enc = self._encode_pose(
+            pose_window["T_world_view_virtual"], cam_fov, sample_id
+        )
 
         supervised_joint_mask = kpt21_3d_valid & hand_kept[..., None]
         required_joint_mask = np.broadcast_to(
@@ -394,6 +705,7 @@ class MyDataDataset(BaseClipDataset):
             raise RuntimeError(f"sample {sample_id}: invalid fps={fps}")
 
         return {
+            # Upstream MINT-compatible fields.
             "images": images,
             "gt_pose_enc": gt_pose_enc,
             "state_mask": torch.zeros(2, dtype=torch.bool),
@@ -403,7 +715,10 @@ class MyDataDataset(BaseClipDataset):
             "mano_gt_valid": torch.tensor(mano_gt_valid, dtype=torch.bool),
             "kpt21_gt": torch.from_numpy(kpt21_3d),
             "kpt21_gt_valid": torch.tensor(kpt21_gt_valid, dtype=torch.bool),
+
+            # Calibrated/QC fields retained for validation and future tooling.
             "K_virtual": K_virtual,
+            "view_K_virtual": K_virtual.clone(),
             "cam_fov": cam_fov,
             "hand_kept_raw": torch.from_numpy(hand_kept_raw.copy()),
             "quality_mask": torch.from_numpy(quality_mask.copy()),
@@ -413,6 +728,20 @@ class MyDataDataset(BaseClipDataset):
             "kpt21_2d_valid": torch.from_numpy(kpt21_2d_valid.copy()),
             "frame_index": torch.from_numpy(frame_index.copy()),
             "timestamp": torch.from_numpy(timestamp.copy()),
+            "slam_T_world_from_wnl": torch.from_numpy(
+                pose_window["T_world_wnl"].astype(np.float32)
+            ),
+            "T_world_view_virtual": torch.from_numpy(
+                pose_window["T_world_view_virtual"].astype(np.float32)
+            ),
+            "slam_valid": torch.from_numpy(pose_window["slam_valid"].copy()),
+            "camera_loss_mask": torch.from_numpy(pose_window["slam_valid"].copy()),
+            "frame_ts_ns": torch.from_numpy(pose_window["frame_ts_ns"].copy()),
+            "query_ts_ns": torch.from_numpy(pose_window["query_ts_ns"].copy()),
+            "view_raw_from_left": torch.from_numpy(
+                pose_window["view_raw_from_left"].astype(np.float32)
+            ),
+            "camera_pose_source": pose_window["source"],
             "fps": torch.tensor(fps, dtype=torch.float32),
             "sample_id": sample_id,
             "view": str(meta["view"]),
