@@ -10,6 +10,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from core.registry import DATASETS
 from data.lingbotmap.lerobot_v3 import LeRobotV3Dataset
+from data.my_data.dataset import MyDataDataset
 from data.sampling import (
     dataset_sample_seed,
     deterministic_subset_indices,
