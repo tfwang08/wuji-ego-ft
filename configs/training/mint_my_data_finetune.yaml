@@ -1,0 +1,133 @@
+# Fine-tune the released MINT checkpoint on normalized stereo virtual-camera data.
+# Update data.root if your normalized dataset lives elsewhere.
+model:
+  name: split_fov_head
+  pretrained: null
+  enable_hand: true
+  hand_head:
+    name: refine
+    dim: 512
+    num_queries: 4
+    num_iterations: 2
+    trunk_depth: 1
+    rotation_refine_mode: compose_axis_angle
+    rotation_delta_frame: local
+    rotation_delta_max_angle_deg: 30.0
+  enable_hand_presence: true
+  hand_presence_head:
+    dim: 256
+    num_heads: 4
+  fov_head:
+    dim: 512
+    num_heads: 8
+    trunk_depth: 2
+    initial_fov_deg: [60.0, 75.0]
+    min_fov_rad: 1.0e-4
+  backbone:
+    img_size: 518
+    patch_size: 14
+    embed_dim: 1024
+    use_sdpa: true
+    use_gradient_checkpoint: true
+    camera_num_iterations: 4
+    enable_camera: true
+    enable_depth: false
+    enable_point: false
+    enable_local_point: false
+
+data:
+  name: my_data
+  root: data/my_data
+  split: train
+  clip_len: 32
+  size_hw: [378, 518]
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+
+  # Keep both left/right hand supervision in each monocular view sample so the
+  # upstream hand-presence target keeps its original semantics.
+  target_hand_only: false
+  strict_target_window: true
+  quality_tiers: [gold]
+
+  # This manifest/NPZ dataset is not LeRobot parquet, so do not run the
+  # LeRobot-specific automatic camera-statistics scanner.
+  camera_translation_normalization:
+    enabled: false
+
+  author_projector_compatible: true
+  principal_point_tolerance_px: 0.5
+  intrinsics_tolerance: 1.0e-6
+  pose_rigid_tolerance: 1.0e-5
+  pose_roundtrip_tolerance: 1.0e-5
+
+loss:
+  hand_presence:
+    weight: 2.0
+  image_hand:
+    weight: 0.01
+    min_depth: 0.01
+    presence_threshold: 0.0
+  camera:
+    weight: 1.0
+    terms:
+      - {name: trans_l1, weight: 0.025}
+      - {name: trans_scale_aligned_l1, weight: 0.25}
+      - {name: rot_geo, weight: 0.5}
+      - {name: rot_vel_geo, weight: 0.25}
+  fov:
+    weight: 2.0
+    terms:
+      - {name: fov_l1, weight: 1.0}
+      - {name: fov_vel_l1, weight: 0.05}
+  mano_param:
+    weight: 1.0
+    terms:
+      - {name: transl_l1, weight: 2.0}
+      - {name: orient_geo, weight: 1.0}
+      - {name: pose_geo, weight: 1.0}
+      - {name: betas_l1, weight: 0.3}
+      - {name: betas_consistency_l1, weight: 0.2}
+      - {name: transl_vel_l1, weight: 0.25}
+      - {name: orient_vel_geo, weight: 0.25}
+      - {name: transl_acc_l1, weight: 0.25}
+      - {name: orient_acc_geo, weight: 0.1}
+
+train:
+  # The released full MINT checkpoint contains backbone + camera/FoV + hand heads.
+  init_from: checkpoints/model.safetensors
+  run_name: my-data-finetune
+  reproducibility:
+    enabled: true
+    seed: 42
+    deterministic_algorithms: false
+  epochs: 1
+  log_every: 5
+  ckpt_every: 500
+  grad_clip: 0.0
+  grad_value_clip: 1.0
+  grad_accum: 1
+  mixed_precision: bf16
+  wandb:
+    enabled: true
+    project: lingbotmap-distill
+    name: null
+    mode: offline
+
+optim:
+  lr: 1.0e-4
+  param_groups:
+    - {match: backbone.camera_head, lr: 1.0e-4}
+    - {match: backbone.fov_head, lr: 1.0e-4}
+    - {match: backbone, lr: 5.0e-5}
+    - {match: hand_head, lr: 5.0e-4}
+    - {match: hand_presence_head, lr: 5.0e-4}
+  weight_decay: 0.05
+  warmup_steps: 2000
+
+dist:
+  nnodes: 1
+  gpus_per_node: 8
+  master_addr: 127.0.0.1
+  master_port: 29500
