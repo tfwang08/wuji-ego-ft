@@ -1,7 +1,7 @@
 """Generic normalized MINT fine-tuning dataset exposed from the x2robot path.
 
 The canonical X2Robot camera poses are C2W, while the upstream MINT camera
-loss consumes first-frame-rebased W2C extrinsics.  Keep that conversion in the
+loss consumes first-frame-rebased W2C extrinsics. Keep that conversion in the
 data adapter so the model, forward path, and losses stay untouched.
 """
 
@@ -10,6 +10,16 @@ import torch
 
 from data.x2robot.mint_dataset import MyDataDataset, _check_rigid_transforms
 from lingbot_map.utils.rotation import mat_to_quat, quat_to_mat
+
+
+_BASE_MY_DATA_INIT = MyDataDataset.__init__
+
+
+def _init_with_bimanual_default(self, cfg: dict):
+    """Keep both hands unless a caller explicitly requests target-hand-only mode."""
+    cfg = dict(cfg)
+    cfg.setdefault("target_hand_only", False)
+    _BASE_MY_DATA_INIT(self, cfg)
 
 
 def _encode_pose_as_upstream_w2c(
@@ -27,7 +37,7 @@ def _encode_pose_as_upstream_w2c(
         )
 
     # Official MINT starts from W2C extrinsics E_t=[R_t|T_t] and rebases with
-    # R'_t = R_t R_0^T, T'_t = T_t - R'_t T_0.  Because C_t = inv(E_t), the
+    # R'_t = R_t R_0^T, T'_t = T_t - R'_t T_0. Because C_t = inv(E_t), the
     # exact same transform is E_t @ inv(E_0) = inv(C_t) @ C_0.
     w2c = np.linalg.inv(c2w)
     T_rel_w2c = w2c @ c2w[0][None]
@@ -89,9 +99,10 @@ def _encode_pose_as_upstream_w2c(
     return gt_pose_enc.contiguous()
 
 
-# Patch the registered dataset class itself.  Importing data.x2robot.mint_dataset
-# always initializes this package first, so the registry and direct imports both
-# observe the same corrected class object.
+# Patch the registered dataset class itself. Importing data.x2robot.mint_dataset
+# initializes this package first, so the registry and direct imports both observe
+# the same corrected class object.
+MyDataDataset.__init__ = _init_with_bimanual_default
 MyDataDataset._encode_pose = _encode_pose_as_upstream_w2c
 
 __all__ = ["MyDataDataset"]
